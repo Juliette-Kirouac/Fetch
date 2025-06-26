@@ -1,29 +1,32 @@
-"""
-fetch_point_checked.py – Compute fetch from one point + warning on large jumps.
-
-Usage:
-  python fetch_point_checked.py \
-    --in land_30m.tif \
-    --lon -73.5 --lat 45.45 \
-    --step 2 \
-    --warn 100
-"""
-
-import argparse
 import math
 from pathlib import Path
+import csv
 
 import numpy as np
 import rasterio
 from rasterio.enums import Resampling
+import geopandas as gpd
+from shapely.geometry import Point, LineString, Polygon
 
 
 def compute_fetch_at_point(mask, cell_x, cell_y, row, col, azimuths):
+    """
+    Compute directional fetch from a single point.
+
+    Parameters:
+    - mask: 2D numpy array of bool (True=water, False=land)
+    - cell_x, cell_y: pixel size in CRS units (meters)
+    - row, col: origin pixel indices
+    - azimuths: iterable of azimuth angles (degrees clockwise from North)
+
+    Returns:
+    - dict mapping azimuth -> fetch distance (meters)
+    """
     results = {}
     for az in azimuths:
         rad = math.radians(az)
-        dr = -math.cos(rad)    # 0°→nord
-        dc = math.sin(rad)
+        dr = -math.cos(rad)    # 0° → north
+        dc =  math.sin(rad)    # 90° → east
         step_len = math.hypot(dr * cell_y, dc * cell_x)
 
         dist = 0.0
@@ -33,83 +36,144 @@ def compute_fetch_at_point(mask, cell_x, cell_y, row, col, azimuths):
             if rr < 0 or rr >= mask.shape[0] or cc < 0 or cc >= mask.shape[1]:
                 break
             ri, ci = int(round(rr)), int(round(cc))
-            if not mask[ri, ci]:
+            if not mask[ri, ci]:  # hit land
                 break
             dist += step_len
-
         results[az] = dist
     return results
 
 
+def warn_on_jumps(fetch_dict, threshold):
+    """
+    Print warnings when fetch distances have large jumps.
+
+    Parameters:
+    - fetch_dict: dict of azimuth -> distance
+    - threshold: float, jump threshold in meters
+    """
+    azs = sorted(fetch_dict.keys())
+    values = [fetch_dict[az] for az in azs]
+    n = len(values)
+    for i in range(n):
+        d1, d2 = values[i], values[(i+1) % n]
+        delta = abs(d2 - d1)
+        if delta > threshold:
+            print(f"⚠️ Jump of {delta:.1f} m between {azs[i]:.1f}° and {azs[(i+1)%n]:.1f}°")
+    overall = max(values) - min(values)
+    if overall > threshold:
+        print(f"⚠️ Overall fetch range {overall:.1f} m exceeds threshold {threshold:.1f} m")
+
+
+def rowcol_to_xy(transform, row, col):
+    """
+    Convert raster row/col indices to geographic coordinates (x, y).
+
+    Parameters:
+    - transform: Affine transform from rasterio
+    - row, col: integer pixel indices
+
+    Returns:
+    - tuple (x, y) in CRS units
+    """
+    x = transform.c + col * transform.a + row * transform.b
+    y = transform.f + col * transform.d + row * transform.e
+    return x, y
+
+
+def export_shapefiles(fetch_dict, origin_xy, crs, out_lines, out_envelope):
+    """
+    Export fetch lines and envelope as Shapefiles.
+
+    Parameters:
+    - fetch_dict: dict of azimuth -> distance
+    - origin_xy: tuple (x, y) in CRS coordinates
+    - crs: rasterio CRS or equivalent
+    - out_lines: path to output lines shapefile (.shp)
+    - out_envelope: path to output envelope shapefile (.shp)
+    """
+    lon, lat = origin_xy
+    line_records = []
+    endpoints = []
+    for az in sorted(fetch_dict.keys()):
+        dist = fetch_dict[az]
+        rad = math.radians(az)
+        dx = math.sin(rad) * dist
+        dy = math.cos(rad) * dist
+        end_x = lon + dx
+        end_y = lat + dy
+        endpoints.append((end_x, end_y))
+        line = LineString([(lon, lat), (end_x, end_y)])
+        line_records.append({
+            'azimuth': float(az),
+            'distance_m': float(dist),
+            'geometry': line
+        })
+    # write lines
+    gdf_lines = gpd.GeoDataFrame(line_records, crs=crs)
+    gdf_lines.to_file(out_lines, driver='ESRI Shapefile')
+
+    # write envelope
+    ring = endpoints + [endpoints[0]]
+    poly = Polygon(ring)
+    gdf_env = gpd.GeoDataFrame([{'geometry': poly}], crs=crs)
+    gdf_env.to_file(out_envelope, driver='ESRI Shapefile')
+
+
+def export_csv(fetch_dict, output_csv):
+    """
+    Export fetch distances to CSV.
+
+    Parameters:
+    - fetch_dict: dict of azimuth -> distance
+    - output_csv: path to output CSV file
+    """
+    with open(output_csv, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['azimuth_deg', 'distance_m'])
+        for az in sorted(fetch_dict.keys()):
+            writer.writerow([az, fetch_dict[az]])
+
+
 def main():
-    p = argparse.ArgumentParser(
-        description="Fetch for one point + warn on large directional jumps.")
-    # p.add_argument("--in", dest="in_raster", required=True,
-    #                help="Input GeoTIFF (0=water,1=land)")
-    # p.add_argument("--lon", type=float, help="X coordinate in raster CRS")
-    # p.add_argument("--lat", type=float, help="Y coordinate in raster CRS")
-    # p.add_argument("--row", type=int, help="Row index (0-based)")
-    # p.add_argument("--col", type=int, help="Col index (0-based)")
-    # p.add_argument("--step", type=float, default=2.0,
-    #                help="Angular step in degrees (default 2°)")
-    # p.add_argument("--warn", type=float, default=None,
-    #                help="Threshold (m) for alerting on large fetch jumps")
-    # args = p.parse_args()
-    
-    in_raster = "land_30m_v3.tif"       # votre fichier
-    step = 2                         # Angular step in degrees (default 2°)
-    row = 8584                       # Row index (0-based)
-    col = 1405                       # Col index (0-based)
-    lon = None                       # X coordinate in raster CRS
-    lat = None                       # Y coordinate in raster CRS
-    warn = 10000                     # Threshold (m) for alerting on large fetch jumps
+    # Customize parameters below
+    in_raster = 'land_30m_v3.tif'
+    # Choose either lon/lat or row/col
+    use_rowcol = True
+    lon = None; lat = None
+    row, col = 8584, 1405
+    step = 2.0
+    warn_threshold = 10000
+    out_lines = 'fetch_lines.shp'
+    out_envelope = 'fetch_env.shp'
+    out_csv = 'fetch_results.csv'
 
-    # --- load raster and mask ---
+    # load raster and mask
     with rasterio.open(in_raster) as src:
-        arr = src.read(1, out_dtype="uint8", resampling=Resampling.nearest)
-        mask = (arr == 0)  # True = water
-        tr = src.transform
-        cell_x, cell_y = abs(tr.a), abs(tr.e)
-
-        if lon is not None and lat is not None:
+        arr = src.read(1, out_dtype='uint8', resampling=Resampling.nearest)
+        mask = (arr == 0)
+        transform = src.transform
+        crs = src.crs
+        if use_rowcol:
+            x, y = rowcol_to_xy(transform, row, col)
+        else:
+            x, y = lon, lat
             row, col = src.index(lon, lat)
-        elif row is not None and col is not None:
-            row, col = row, col
-        else:
-            p.error("Provide --lon/--lat or --row/--col.")
+        cell_x = abs(transform.a)
+        cell_y = abs(transform.e)
 
-    # --- compute fetch distances ---
+    # compute fetch
     azs = np.arange(0.0, 360.0, step, dtype=np.float32)
-    fetchs = compute_fetch_at_point(mask, cell_x, cell_y, row, col, azs)
+    fetch_dict = compute_fetch_at_point(mask, cell_x, cell_y, row, col, azs)
 
-    # --- output results ---
-    print(f"Fetch from point (row={row}, col={col}):\n")
-    sorted_az = sorted(fetchs.keys())
-    values = [fetchs[az] for az in sorted_az]
-    for az, dist in zip(sorted_az, values):
-        print(f"  {az:6.1f}° → {dist:8.1f} m")
+    # warn on jumps
+    warn_on_jumps(fetch_dict, warn_threshold)
 
-    # --- warning on large jumps ---
-    if warn is not None:
-        # check adjacent directions
-        print(f"\nChecking for jumps > {warn:.1f} m...")
-        # compute differences between successive directions (circular)
-        diffs = []
-        n = len(sorted_az)
-        for i in range(n):
-            d1 = values[i]
-            d2 = values[(i+1) % n]
-            delta = abs(d2 - d1)
-            diffs.append(delta)
-            if delta > warn:
-                print(f" ⚠️ Jump of {delta:.1f} m between {sorted_az[i]:.1f}° and {sorted_az[(i+1)%n]:.1f}°")
-        # overall max-min
-        overall = max(values) - min(values)
-        if overall > warn:
-            print(f" ⚠️ Overall fetch range is {overall:.1f} m (max-min) exceeding {warn:.1f} m")
-        else:
-            print(" No jumps exceed threshold.")
-    
+    # export outputs
+    export_shapefiles(fetch_dict, (x, y), crs, out_lines, out_envelope)
+    export_csv(fetch_dict, out_csv)
 
-if __name__ == "__main__":
+    print('Done. Files:', out_lines, out_envelope, out_csv)
+
+
+if __name__ == '__main__':
     main()
