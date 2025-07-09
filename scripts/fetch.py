@@ -267,7 +267,7 @@ def export_csv(fetch_dict, output_csv):
             writer.writerow([az, fetch_dict[az]])
 
 
-def run_fetch(use_vector, velocity, direction, time, depth_limit=100, depth=math.inf,
+def run_fetch(use_vector, velocity, time, depth_limit=100, depth=math.inf,
               g=9.81,raster_path=None, vector_path=None,
               origin_rowcol=None, origin_lonlat=None,
               max_dist=None, step=None, angles_list=None,
@@ -287,36 +287,26 @@ def run_fetch(use_vector, velocity, direction, time, depth_limit=100, depth=math
     if warn_thresh>0: warn_on_jumps(fetch,warn_thresh)
     if out_lines and out_env: export_shapefiles(fetch,origin_xy,crs,out_lines,out_env)
     if out_csv: export_csv(fetch,out_csv)
-    # waves = []
-    # for fetch in fetch:
-    wave_data = jonswap(fetch, azs, velocity, direction, time, g, depth_limit, depth, warn_thresh)
-    #     np.append(waves, wave_data, axis=1) 
-    return fetch, origin_xy, wave_data
+    wave_data = {}
+    for az in azs:
+        f = fetch[az]
+        wave_data[float(az)] = jonswap(f, az, velocity, time, g, depth_limit, depth, warn_thresh)
+    waves = pd.DataFrame(wave_data, index=["Hm0","Tp","Fetch","Velocity"]).T
+    return origin_xy, waves
 
-
-def jonswap(fetch, azs, velocity, direction, time, g, depth_limit, depth, warn_thresh):
+def jonswap(fetch, azs, velocity, time, g, depth_limit, depth, warn_thresh):
     pass
     """
     Return the wave height and peak period for any arbitrary wind direction, speed and fetch using the JONSWAP method.
     """
-    # Normalize direction into [0, 360]
-    direction = direction % 360
-    try:
-        F = fetch[direction]
-    except KeyError:
-        # Interpolation
-        pos = np.searchsorted(azs, direction) % azs.size
-        lower_idx = azs[pos - 1]
-        upper_idx = azs[pos]
-        print(f"Warning: Fetch for {direction}° not found. Approximating as average of {lower_idx}° and {upper_idx}° fetches.")
-        if fetch[upper_idx] - fetch[lower_idx] > warn_thresh:
-            print(f"Warning: Distance between {lower_idx}° and {upper_idx}° too big to interpolate")
-            return
-        Fetch = fetch[upper_idx] - (fetch[upper_idx] - fetch[lower_idx])*(upper_idx-direction)/(upper_idx-lower_idx)
+
         
     # Find F*, t* and Feff* (adimensional numbers)
-    F = g*Fetch/velocity**2
+    F = g*fetch/(velocity**2)
     t = g*time/velocity
+    t_max = 71500
+    t = min(t, t_max)
+    
     Feff = (t/68.8)**(3/2)
     if F > Feff:
         # time-limited waves
@@ -332,15 +322,11 @@ def jonswap(fetch, azs, velocity, direction, time, g, depth_limit, depth, warn_t
     # Cap values
     Hm0_max = 0.243
     Tp_max = 8.13
-    t_max = 71500
     Hm0 = min(Hm0, Hm0_max)
     Tp = min(Tp, Tp_max)
-    t = min(t, t_max)
+    
+    # Back to dimensional numbers
+    Hm0 = Hm0*velocity**2/g
+    Tp = Tp*velocity/g
 
-    return {
-    "Hm0": Hm0,
-    "Tp": Tp,
-    "Fetch": Fetch,
-    "Velocity": velocity,
-    "Direction": direction
-    }
+    return [Hm0, Tp, fetch, velocity]
